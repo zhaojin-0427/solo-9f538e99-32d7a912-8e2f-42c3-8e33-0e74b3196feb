@@ -7,6 +7,8 @@
   总页数 `total_pages`。管理接口可发布/切换修订、注入缺页、超时、同版同站冲突故障。
 - **collector**(采集与查询 API,FastAPI + SQLite):采集某 UTC 小时前先固定源站当前版,
   再逐版补齐;每个确认版的完整快照均可查询;数据与当前版指针在同一事务生效。
+  另提供**名册登记**与**区间核查**:站点投运/退役后,质控员可按当时名册核查各小时
+  PM2.5 数据是否到齐。
 
 ## 快速开始
 
@@ -17,7 +19,7 @@ docker compose up --build
 - 采集/查询 API: http://localhost:8000 (文档 `/docs`)
 - 模拟源站: http://localhost:8001 (文档 `/docs`)
 
-端到端冒烟(35+ 项断言,覆盖缺页/超时/冲突/回退):
+端到端冒烟(59 项断言,覆盖缺页/超时/冲突/回退/名册并发/区间核查):
 
 ```bash
 python3 scripts/smoke.py
@@ -44,6 +46,27 @@ curl 'localhost:8000/hours/2026-11-18T10/data?version=3&station_id=S07'
 curl localhost:8000/hours/2026-11-18T10/versions
 ```
 
+## 名册登记与区间核查
+
+```bash
+# 1. 登记名册:UTC 生效小时 + 完整站点集合 + 所见名册版本(首次登记 seen_version=0)
+curl -X POST localhost:8000/rosters -H 'Content-Type: application/json' -d \
+  '{"effective_hour":"2026-11-18T10","seen_version":0,"stations":["S01","S02","S03"]}'
+
+# 2. 修改名册:须带当前版本;版本不符(同版并发修改)返回 409,原名册保留
+curl -X POST localhost:8000/rosters -H 'Content-Type: application/json' -d \
+  '{"effective_hour":"2026-11-18T10","seen_version":1,"stations":["S01","S03","S05"]}'
+
+# 3. 区间核查:至多 48 个连续 UTC 小时
+curl 'localhost:8000/audit?from=2026-11-18T08&hours=24'
+```
+
+核查逐小时返回 `roster_version`(当时生效名册版)、`data_version`(已确认默认供数版)、
+`missing_stations`(名册有而数据缺)、`extra_stations`(数据有而名册外);没有名册或
+尚未采集的小时分别以 `status=no_roster / not_collected` 标明。补登较早名册或采集修订
+后,受影响小时立即按新状态核查;整个区间在单个只读事务内读取,不混用交错提交前后
+的名册与读数。
+
 ## 故障注入演示(缺页 / 超时 / 同版同站冲突)
 
 ```bash
@@ -68,6 +91,15 @@ curl -X DELETE localhost:8001/admin/faults   # 清除全部故障
 | 已确认版均可查当时完整数据 | 每版确认时物化全量快照到 `entries`,`GET /hours/{hour}/data?version=N` |
 | 数据与当前版指针一同生效 | 单事务写入 `versions` + `entries` + `hours.current_version`(`db.py::tx`) |
 | 失败或重启不得暴露半版 | 事务原子提交;启动时仅复位 `collecting` 状态元信息;SQLite WAL + 数据卷持久化 |
+| 名册登记:UTC 生效小时 + 完整站点集合 + 所见版本 | `POST /rosters`;`rosters` 表按生效小时存全量站点与名册版本(从 1 起) |
+| 同版并发修改只允许一份生效,失败保留原名册 | 登记在 `BEGIN IMMEDIATE` 事务内比对 `seen_version` 后写入,不一致即 409 回滚(`roster.py::register_roster`) |
+| 区间核查至多 48 个连续 UTC 小时 | `GET /audit?from=..&hours=N`,`hours` 限 1..48 |
+| 逐小时按当时生效名册对照已确认默认供数版 | 每小时取 `effective_hour<=hour` 的最新名册 × `hours.current_version` 快照(`roster.py::_audit_hour`) |
+| 返回名册版/数据版/缺站/多出站点 | 结果字段 `roster_version`/`data_version`/`missing_stations`/`extra_stations` |
+| 没有名册或尚未采集的小时分别标明 | `status` = `no_roster` / `not_collected`(到齐为 `ok`,不齐为 `mismatch`) |
+| 补登较早名册或采集修订后立即按新状态核查 | 核查实时计算,不落缓存 |
+| 区间结果不混用交错提交前后的名册与读数 | 整个区间在单个只读事务(WAL 一致快照)内读取(`roster.py::audit_range`) |
+| 原按版查询照旧 | 既有端点未改动 |
 
 ## API 一览
 
@@ -80,6 +112,10 @@ curl -X DELETE localhost:8001/admin/faults   # 清除全部故障
 | GET | `/hours` | 全部小时及当前版指针 |
 | GET | `/hours/{hour}/versions` | 已确认版列表 |
 | GET | `/hours/{hour}/data` | 某版完整数据;`version` 缺省取当前版,`station_id` 可单站过滤 |
+| POST | `/rosters` | 登记名册:`{"effective_hour","seen_version","stations"}`;版本不符 409,原名册保留 |
+| GET | `/rosters` | 全部已登记名册(按生效小时升序) |
+| GET | `/rosters/{hour}` | 某 UTC 生效小时的名册 |
+| GET | `/audit` | 区间核查:`from` 起始 UTC 小时,`hours` 连续小时数(1..48,缺省 24) |
 
 **source(8001)**
 

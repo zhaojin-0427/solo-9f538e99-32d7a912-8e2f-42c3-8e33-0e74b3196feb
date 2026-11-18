@@ -38,6 +38,12 @@ CREATE TABLE IF NOT EXISTS entries (
     pm25       REAL NOT NULL,
     PRIMARY KEY (hour, version, station_id)
 );
+CREATE TABLE IF NOT EXISTS rosters (
+    effective_hour TEXT PRIMARY KEY,          -- UTC 生效小时,如 2026-11-18T10
+    version        INTEGER NOT NULL,          -- 名册版本:从 1 起,每次成功修改 +1
+    stations       TEXT NOT NULL,             -- JSON 数组:当时起完整在运站点集合(已排序)
+    updated_at     TEXT NOT NULL
+);
 """
 
 

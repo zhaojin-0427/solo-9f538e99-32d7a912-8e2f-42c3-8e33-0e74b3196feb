@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 import urllib.error
 import urllib.request
 
@@ -128,7 +129,107 @@ def main() -> int:
         snap = stations(COLLECTOR, HOUR, v["version"])
         check(f"v{v['version']} 快照站数={v['station_count']}", len(snap) == v["station_count"])
 
-    print("-- 8. 源站回退保护")
+    print("-- 8. 名册登记:生效小时 + 完整站点集合 + 所见版本")
+    v6 = stations(COLLECTOR, HOUR, 6)
+    roster_stations = sorted(v6)
+    _, a = req("GET", COLLECTOR, f"/audit?from={HOUR}&hours=1")
+    check("登记前该小时 no_roster", a["results"][0]["status"] == "no_roster", json.dumps(a))
+    _, r = req("POST", COLLECTOR, "/rosters",
+               {"effective_hour": HOUR, "seen_version": 0, "stations": roster_stations})
+    check("名册 v1 登记成功", r["version"] == 1 and r["station_count"] == len(roster_stations),
+          json.dumps(r))
+    req("POST", COLLECTOR, "/rosters",
+        {"effective_hour": HOUR, "seen_version": 0, "stations": ["ZZZ"]}, expect=409)
+    check("过期所见版本被拒(409)", True)
+    _, g = req("GET", COLLECTOR, f"/rosters/{HOUR}")
+    check("冲突后原名册保留", g["version"] == 1 and g["stations"] == roster_stations)
+    req("POST", COLLECTOR, "/rosters",
+        {"effective_hour": HOUR, "seen_version": 1,
+         "stations": ["DUP", "DUP"]}, expect=400)
+    check("站点集合重复被拒(400)", True)
+
+    print("-- 9. 同版并发修改:只有一份生效,失败保留原名册")
+    codes: list[int] = []
+
+    def _reg() -> None:
+        c, _ = req("POST", COLLECTOR, "/rosters",
+                   {"effective_hour": HOUR, "seen_version": 1,
+                    "stations": roster_stations}, expect=None)
+        codes.append(c)
+
+    threads = [threading.Thread(target=_reg) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    check("并发同版修改恰好一份生效", sorted(codes) == [200, 409], str(codes))
+    _, g = req("GET", COLLECTOR, f"/rosters/{HOUR}")
+    check("并发后名册 v2 且内容未串改", g["version"] == 2 and g["stations"] == roster_stations)
+
+    print("-- 10. 区间核查:缺站/多出/无名册/未采集")
+    dropped = roster_stations[0]
+    modified = roster_stations[1:] + ["GHOST01"]
+    _, r = req("POST", COLLECTOR, "/rosters",
+               {"effective_hour": HOUR, "seen_version": 2, "stations": modified})
+    check("名册 v3 修改成功", r["version"] == 3)
+    _, a = req("GET", COLLECTOR, f"/audit?from={HOUR}&hours=1")
+    res = a["results"][0]
+    check("核查 mismatch", res["status"] == "mismatch", json.dumps(res))
+    check("缺站=名册有而数据缺", res["missing_stations"] == ["GHOST01"], json.dumps(res))
+    check("多出=数据有而名册外", res["extra_stations"] == [dropped], json.dumps(res))
+    check("返回名册版与数据版", res["roster_version"] == 3 and res["data_version"] == 6,
+          json.dumps(res))
+    _, r = req("POST", COLLECTOR, "/rosters",
+               {"effective_hour": HOUR, "seen_version": 3, "stations": roster_stations})
+    check("名册 v4 改回与数据一致", r["version"] == 4)
+    _, a = req("GET", COLLECTOR, "/audit?from=2026-11-18T08&hours=4")
+    sts = [x["status"] for x in a["results"]]
+    check("区间状态序列", sts == ["no_roster", "no_roster", "ok", "not_collected"], str(sts))
+    check("未采集小时 data_version=null", a["results"][3]["data_version"] is None)
+    check("未采集小时仍带名册版", a["results"][3]["roster_version"] == 4)
+
+    print("-- 11. 补登较早名册/采集修订:受影响小时立即按新状态核查")
+    H2 = "2026-11-18T12"
+    _, a = req("GET", COLLECTOR, f"/audit?from={H2}&hours=1")
+    check("采集前 not_collected", a["results"][0]["status"] == "not_collected")
+    _, r = req("POST", COLLECTOR, "/collections", {"hour": H2})
+    check("H2 补齐到 v6", r["status"] == "ok" and r["confirmed_to"] == 6, json.dumps(r))
+    _, a = req("GET", COLLECTOR, f"/audit?from={H2}&hours=1")
+    res = a["results"][0]
+    check("采集后立即对照默认供数版", res["status"] == "ok" and res["data_version"] == 6,
+          json.dumps(res))
+    req("POST", SOURCE, "/admin/publish")  # v7:新增 N07
+    _, r = req("POST", COLLECTOR, "/collections", {"hour": H2})
+    check("H2 补齐 v7", r["confirmed_to"] == 7, json.dumps(r))
+    _, a = req("GET", COLLECTOR, f"/audit?from={H2}&hours=1")
+    res = a["results"][0]
+    check("采集修订后核查立即用新数据版", res["data_version"] == 7, json.dumps(res))
+    check("新站未入册 -> mismatch", res["status"] == "mismatch"
+          and res["extra_stations"] == ["N07"], json.dumps(res))
+    early = roster_stations[:-1]
+    _, r = req("POST", COLLECTOR, "/rosters",
+               {"effective_hour": "2026-11-18T08", "seen_version": 0, "stations": early})
+    check("补登较早名册 v1", r["version"] == 1)
+    _, a = req("GET", COLLECTOR, "/audit?from=2026-11-18T08&hours=3")
+    res08, _, res10 = a["results"]
+    check("08 立即按补登名册核查", res08["roster_effective_hour"] == "2026-11-18T08"
+          and res08["roster_version"] == 1 and res08["status"] == "not_collected",
+          json.dumps(res08))
+    check("10 仍用 10 时生效的名册", res10["roster_effective_hour"] == HOUR
+          and res10["roster_version"] == 4 and res10["status"] == "ok", json.dumps(res10))
+    _, lst = req("GET", COLLECTOR, "/rosters")
+    check("名册列表含两份", [x["effective_hour"] for x in lst["rosters"]]
+          == ["2026-11-18T08", HOUR], json.dumps(lst))
+
+    print("-- 12. 区间上限 48 个连续 UTC 小时")
+    _, a = req("GET", COLLECTOR, f"/audit?from={HOUR}&hours=48")
+    check("48 小时可核查", len(a["results"]) == 48 and a["hours"] == 48)
+    req("GET", COLLECTOR, f"/audit?from={HOUR}&hours=49", expect=422)
+    check("超过 48 小时被拒(422)", True)
+    req("GET", COLLECTOR, "/audit?from=2026-11-18", expect=400)
+    check("非法起始小时被拒(400)", True)
+
+    print("-- 13. 源站回退保护")
     req("POST", SOURCE, "/admin/reset", {"station_count": 20, "seed": 1})
     _, r = req("POST", COLLECTOR, "/collections", {"hour": HOUR})
     check("源站回退被拒绝", r["status"] == "source_regressed" and r["current_version"] == 6,
